@@ -1,6 +1,6 @@
 import { useId } from "react";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { formatSwissNumber } from "../utils/formatNumber";
+import { formatSwissDecimal, multiplyToCents, numberToDecimalString } from "../utils/decimal";
 import type { Currency } from "../types";
 
 interface Props {
@@ -42,7 +42,7 @@ export function OutputPanel({
       : null;
   const fiatFormatted =
     fiatValue !== null && balance !== null
-      ? formatSwissNumber(parseFloat(balance) * fiatValue)
+      ? formatSwissDecimal(multiplyToCents(balance, numberToDecimalString(fiatValue)))
       : null;
   const canGeneratePdf = hasBalance && hasPrices;
   const headingId = useId();

@@ -1,5 +1,9 @@
 export type Currency = "CHF" | "EUR" | "USD";
 
+// Which instant of the chosen calendar day (UTC) the balance refers to:
+// "start" = 00:00:00 UTC, "end" = 23:59:59 UTC.
+export type Snapshot = "start" | "end";
+
 export enum EvmBlockchain {
   ETH = "Ethereum",
   BSC = "BinanceSmartChain",

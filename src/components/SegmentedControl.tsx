@@ -5,6 +5,7 @@ interface SegmentedControlProps<T extends string> {
   layout?: "wrap" | "equal";
   ariaLabel?: string;
   ariaLabelledBy?: string;
+  ariaDescribedBy?: string;
 }
 
 // We render plain buttons with aria-pressed instead of the ARIA radio pattern
@@ -18,6 +19,7 @@ export function SegmentedControl<T extends string>({
   layout = "wrap",
   ariaLabel,
   ariaLabelledBy,
+  ariaDescribedBy,
 }: SegmentedControlProps<T>) {
   const container =
     layout === "equal"
@@ -30,6 +32,7 @@ export function SegmentedControl<T extends string>({
       role="group"
       aria-label={ariaLabelledBy ? undefined : ariaLabel}
       aria-labelledby={ariaLabelledBy}
+      aria-describedby={ariaDescribedBy}
       data-print="hide"
     >
       {options.map((option) => {

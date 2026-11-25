@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useSearchParams } from "react-router-dom";
 
@@ -15,27 +15,37 @@ import { LoadingSpinner } from "./components/LoadingSpinner";
 import { useWalletBalance } from "./hooks/useWalletBalance";
 import { useCurrencyPrice } from "./hooks/useCurrencyPrice";
 import { generateWalletBalancePDF } from "./utils/pdfGenerator";
+import { StaleRequestError } from "./hooks/staleRequest";
+import { fetchAssetMap, pickNativeAsset, type AssetMap } from "./core/assets";
 import { blockchainLabel } from "./utils/blockchainLabel";
+import {
+  END_OF_DAY_NOT_REACHED_MESSAGE,
+  SNAPSHOTS,
+  SNAPSHOT_LABEL,
+  SNAPSHOT_UTC_TIME,
+  isParsableDay,
+  isSnapshot,
+  snapshotNotReached,
+} from "./utils/snapshot";
 
 import {
   EvmBlockchain,
   NonEvmBlockchain,
   isSupportedBlockchain,
-  type Asset,
   type Blockchain,
   type Currency,
+  type Snapshot,
   type SupportedAsset,
 } from "./types";
 
 type FormData = {
   date: string;
+  snapshot: Snapshot;
   network: Blockchain;
   asset: SupportedAsset;
   address: string;
   currency: Currency;
 };
-
-type AssetMap = Partial<Record<Blockchain, SupportedAsset[]>>;
 
 // Bitcoin first so the default-selected pill (NonEvmBlockchain.BTC) lives in
 // the top-left position of the segmented control rather than wrapping into a
@@ -47,38 +57,29 @@ const SUPPORTED_NETWORKS: Blockchain[] = [
 
 const CURRENCIES: FormData["currency"][] = ["CHF", "EUR", "USD"];
 
-// Pick the native coin from a per-chain asset list. The DFX API tags native
-// assets with type "Coin" (ETH on Ethereum, BTC on Bitcoin, etc.) — these are
-// the tokens a first-time visitor expects to see selected. We refuse to fall
-// back to an arbitrary first entry: if a supported chain ever ships without a
-// native coin in the asset list it's a data bug we want to surface, not paper
-// over with a silently-wrong default selection.
-function pickNativeAsset(assets: SupportedAsset[]): SupportedAsset {
-  const native = assets.find((a) => a.type === "Coin");
-  if (!native) {
-    const chain = assets[0]?.blockchain ?? "(empty list)";
-    throw new Error(`No native coin found for chain ${chain}`);
-  }
-  return native;
-}
+// 31 December of the previous year — the wealth-tax record date in
+// Switzerland, which is the primary use case for this tool. Used as the
+// form default and in the example link, so the example always stays inside
+// CoinGecko's 365-day history window.
+const previousYearEnd = () => `${new Date().getFullYear() - 1}-12-31`;
 
-// Order assets the way the DFX backend marks them as important: sortOrder
-// ascending (1..9 are the curated mainstream tokens, 99 is the bulk), name
-// alphabetical for ties. The raw API order otherwise puts DFI in front of
-// ETH on Ethereum, which is surprising in a tax-report context.
-function sortAssetsByDfxOrder(assets: SupportedAsset[]): SupportedAsset[] {
-  return [...assets].sort((a, b) => {
-    const sa = a.sortOrder ?? Number.MAX_SAFE_INTEGER;
-    const sb = b.sortOrder ?? Number.MAX_SAFE_INTEGER;
-    if (sa !== sb) return sa - sb;
-    return a.name.localeCompare(b.name);
-  });
-}
+const EXAMPLE_ADDRESS = "0xde0B295669a9FD93d5F28D9Ec85E40f4cb697BAe";
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | undefined>();
   const [assetMap, setAssetMap] = useState<AssetMap | undefined>();
+  // Kept apart from `error`: the form-change watcher clears `error` on every
+  // field update, but an invalid `?snapshot=` must stay visible until the
+  // user explicitly picks Start of day or End of day.
+  const [snapshotParamError, setSnapshotParamError] = useState<string | undefined>();
+  // The form values of the request whose balance and price are shown. The
+  // PDF and the result panel use these, never the live form, so they always
+  // describe one and the same request; only the currency stays live.
+  const [submittedRequest, setSubmittedRequest] = useState<FormData | null>(null);
+  // Number of the latest submit; a form change bumps it, so an older
+  // request stops before its price lookup and never reports an error.
+  const latestSubmit = useRef(0);
 
   // Section-heading IDs let us bind each form control to its label via
   // aria-labelledby — keyboard and screen-reader users get a proper
@@ -87,12 +88,21 @@ export default function App() {
   const blockchainHeadingId = useId();
   const tokenHeadingId = useId();
   const dateHeadingId = useId();
+  const snapshotHintId = useId();
+  const snapshotErrorId = useId();
   const currencyHeadingId = useId();
 
   const [urlParams] = useSearchParams();
 
   const { balance, loading: balanceLoading, error: balanceError, fetchBalance, reset } = useWalletBalance();
-  const { prices, loading: priceLoading, error: priceError, fetchPrice } = useCurrencyPrice();
+  const {
+    prices,
+    loading: priceLoading,
+    error: priceError,
+    fetchPrice,
+    reset: resetPrice,
+    clearError: clearPriceError,
+  } = useCurrencyPrice();
 
   const {
     register,
@@ -105,9 +115,10 @@ export default function App() {
     defaultValues: {
       currency: "CHF",
       network: NonEvmBlockchain.BTC,
-      // Default to 31 December of the previous year — the wealth-tax record
-      // date in Switzerland, which is the primary use case for this tool.
-      date: `${new Date().getFullYear() - 1}-12-31`,
+      date: previousYearEnd(),
+      // End of day: the year-end record needs the balance after the last
+      // block of 31 December, not the one at 00:00:00 UTC.
+      snapshot: "end",
     },
   });
 
@@ -118,42 +129,47 @@ export default function App() {
   // Currency changes are a special case: switching CHF/EUR/USD re-renders
   // the fiat line from the already-fetched `prices` state, so wiping the
   // balance would force the user to re-fetch for no reason. But we still
-  // clear the error — an error from a previous fetch attempt shouldn't
+  // clear the errors — an error from a previous fetch attempt shouldn't
   // stay stuck once the user touches the form again, even via the currency
-  // toggle.
+  // toggle. A price error disables submit, so it must be cleared here too,
+  // otherwise the user could not retry without reloading the page.
   useEffect(() => {
     const subscription = watch((_value, { name }) => {
       if (name === "currency") {
         setError(undefined);
+        clearPriceError();
         return;
       }
       setError(undefined);
+      latestSubmit.current++;
+      setSubmittedRequest(null);
       reset();
+      resetPrice();
     });
     return () => subscription.unsubscribe();
-  }, [watch, reset]);
+  }, [watch, reset, resetPrice, clearPriceError]);
 
   const selectedNetwork = watch("network");
   const selectedAsset = watch("asset");
   const selectedCurrency = watch("currency");
+  const selectedDate = watch("date");
+  const selectedSnapshot = watch("snapshot");
+
+  // End of day for today (or any day whose 23:59:59 UTC is still ahead) does
+  // not exist on chain yet; the lookup would return the current balance.
+  // An unparseable date is skipped here because DateInput already reports it
+  // and blocks submit.
+  const snapshotError =
+    selectedSnapshot === "end" &&
+    isParsableDay(selectedDate) &&
+    snapshotNotReached(selectedDate, selectedSnapshot, Date.now())
+      ? END_OF_DAY_NOT_REACHED_MESSAGE
+      : undefined;
 
   // Load the supported asset list from the DFX backend and group by chain.
   useEffect(() => {
-    fetch("https://api.dfx.swiss/v1/asset")
-      .then((response) => response.json())
-      .then((data: Asset[]) => {
-        const map: AssetMap = data
-          .filter((asset) => !asset.comingSoon)
-          .filter((asset): asset is SupportedAsset => isSupportedBlockchain(asset.blockchain))
-          .reduce((acc: AssetMap, asset) => {
-            const key = asset.blockchain as Blockchain;
-            if (!acc[key]) acc[key] = [];
-            acc[key]!.push(asset);
-            return acc;
-          }, {});
-        for (const key of Object.keys(map) as Blockchain[]) {
-          map[key] = sortAssetsByDfxOrder(map[key]!);
-        }
+    fetchAssetMap()
+      .then((map) => {
         setAssetMap(map);
 
         // Pick the default asset for the form's default network (Bitcoin).
@@ -204,6 +220,22 @@ export default function App() {
     }
   }, [urlParams]);
 
+  // `?snapshot=start|end`. Any other value (including an empty one) is an
+  // error rather than being replaced by the default.
+  useEffect(() => {
+    const snapshotParam = urlParams.get("snapshot");
+    if (snapshotParam === null) return;
+
+    if (isSnapshot(snapshotParam)) {
+      setSnapshotParamError(undefined);
+      setValue("snapshot", snapshotParam);
+    } else {
+      setSnapshotParamError(
+        `Invalid snapshot in URL parameter: "${snapshotParam}" — use "start" or "end".`,
+      );
+    }
+  }, [urlParams, setValue]);
+
   useEffect(() => {
     const tokenParam = urlParams.get("token");
     if (!tokenParam) return;
@@ -213,6 +245,19 @@ export default function App() {
     if (matchedAsset) {
       setValue("asset", matchedAsset);
     } else if (assetMap) {
+      // Never leave a token of another network selected: fall back to this
+      // network's native coin, as the sync effect below does without a
+      // token parameter, and say why. setValue runs first because the form
+      // watcher clears `error` on every change.
+      const candidates = selectedNetwork ? assetMap[selectedNetwork] : undefined;
+      if (candidates?.length) {
+        try {
+          setValue("asset", pickNativeAsset(candidates));
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          return;
+        }
+      }
       setError(`Token "${tokenParam}" not found in network "${selectedNetwork}"`);
     }
   }, [urlParams, assetMap, selectedNetwork]);
@@ -247,31 +292,50 @@ export default function App() {
   }, [assetMap, selectedNetwork, selectedAsset, urlParams]);
 
   async function onSubmit(data: FormData) {
+    // Balance and price are both read on the asset's own chain; a token left
+    // over from another network must never be reported under this one.
+    if (!data.asset || data.asset.blockchain !== data.network) {
+      setError(
+        `The selected token does not belong to ${blockchainLabel(data.network)} — select the token again.`,
+      );
+      return;
+    }
+    const submit = ++latestSubmit.current;
     setError(undefined);
-    const { date, address, network, asset } = data;
+    // Invalidate a price lookup of an earlier submit that may still run.
+    resetPrice();
+    setSubmittedRequest(data);
+    const { date, snapshot, address, asset } = data;
 
     try {
-      await fetchBalance({
+      const { blockNumber } = await fetchBalance({
         asset,
         walletAddress: address,
         timestamp: date,
+        snapshot,
       });
+      if (submit !== latestSubmit.current) return;
 
       await fetchPrice({
-        contractAddress: asset.chainId,
-        blockchain: network,
+        asset,
         date,
+        snapshot,
+        blockNumber,
       });
     } catch (e) {
+      // A superseded submit stops quietly; its error belongs to old input.
+      if (e instanceof StaleRequestError || submit !== latestSubmit.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }
 
   const generatePDF = async () => {
     try {
-      const formData = watch();
+      if (!submittedRequest) {
+        throw new Error("Fetch the balance and price before generating the PDF.");
+      }
       await generateWalletBalancePDF({
-        formData,
+        formData: submittedRequest,
         balance,
         prices,
         selectedCurrency,
@@ -287,7 +351,7 @@ export default function App() {
     : [];
 
   const isFetching = balanceLoading || priceLoading;
-  const visibleError = balanceError || priceError || error || undefined;
+  const visibleError = balanceError || priceError || error || snapshotParamError || undefined;
 
   return (
     <div className="flex min-h-screen flex-col bg-neutral-150">
@@ -322,7 +386,7 @@ export default function App() {
           >
             <WalletAddressInput register={register} errors={errors} setValue={setValue} />
 
-            <SectionRow title="Blockchain" variant="first" headingId={blockchainHeadingId}>
+            <SectionRow title="Blockchain" variant="first" headingId={blockchainHeadingId} printHidden>
               <SegmentedControl<Blockchain>
                 options={availableNetworks.map((n) => ({ value: n, label: blockchainLabel(n) }))}
                 value={selectedNetwork}
@@ -331,7 +395,7 @@ export default function App() {
               />
             </SectionRow>
 
-            <SectionRow title="Token" headingId={tokenHeadingId}>
+            <SectionRow title="Token" headingId={tokenHeadingId} printHidden>
               <TokenSelect
                 options={selectedNetwork ? assetMap[selectedNetwork] ?? [] : []}
                 value={selectedAsset}
@@ -343,9 +407,30 @@ export default function App() {
 
             <SectionRow title="Balance Date" headingId={dateHeadingId}>
               <DateInput register={register} errors={errors} ariaLabelledBy={dateHeadingId} />
+              <div className="mt-2 w-full">
+                <SegmentedControl<Snapshot>
+                  options={SNAPSHOTS.map((s) => ({ value: s, label: SNAPSHOT_LABEL[s] }))}
+                  value={selectedSnapshot}
+                  onChange={(value) => {
+                    setSnapshotParamError(undefined);
+                    setValue("snapshot", value);
+                  }}
+                  layout="equal"
+                  ariaLabelledBy={dateHeadingId}
+                  ariaDescribedBy={snapshotError ? `${snapshotHintId} ${snapshotErrorId}` : snapshotHintId}
+                />
+                <p id={snapshotHintId} className="mt-1 px-2.5 text-xs font-medium text-neutral-700">
+                  Balance as of {SNAPSHOT_UTC_TIME[selectedSnapshot]} on the selected date.
+                </p>
+                {snapshotError && (
+                  <p id={snapshotErrorId} className="mt-1 px-2.5 text-xs font-medium text-red-500">
+                    {snapshotError}
+                  </p>
+                )}
+              </div>
             </SectionRow>
 
-            <SectionRow title="Currency" variant="last" headingId={currencyHeadingId}>
+            <SectionRow title="Currency" variant="last" headingId={currencyHeadingId} printHidden>
               <SegmentedControl<FormData["currency"]>
                 options={CURRENCIES.map((c) => ({ value: c, label: c }))}
                 value={selectedCurrency}
@@ -357,12 +442,12 @@ export default function App() {
 
             <div className="px-5 pb-5">
               <OutputPanel
-                tokenName={selectedAsset?.name ?? ""}
+                tokenName={submittedRequest ? submittedRequest.asset.name : (selectedAsset?.name ?? "")}
                 balance={balance}
                 prices={prices}
                 currency={selectedCurrency}
                 isFetching={isFetching}
-                canSubmit={isValid && !visibleError}
+                canSubmit={isValid && !visibleError && !snapshotError}
                 onSubmit={handleSubmit(onSubmit)}
                 onGeneratePdf={generatePDF}
                 errorMessage={visibleError}
@@ -374,10 +459,10 @@ export default function App() {
         <p className="px-4 pb-8 text-center text-sm text-neutral-700">
           Example:{" "}
           <a
-            href="/?network=Ethereum&token=USDT&address=0xde0B295669a9FD93d5F28D9Ec85E40f4cb697BAe&date=2024-12-31"
+            href={`/?network=Ethereum&token=USDT&address=${EXAMPLE_ADDRESS}&date=${previousYearEnd()}&snapshot=end`}
             className="break-all rounded-sm text-brand-800 underline underline-offset-2 decoration-brand-800/50 hover:decoration-brand-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2"
           >
-            /?network=Ethereum&amp;token=USDT&amp;address=0xde0B…&amp;date=2024-12-31
+            {`/?network=Ethereum&token=USDT&address=${EXAMPLE_ADDRESS.slice(0, 6)}…&date=${previousYearEnd()}&snapshot=end`}
           </a>
         </p>
       </main>
